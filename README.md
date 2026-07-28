@@ -10,7 +10,9 @@ The goal is to identify, for each of a chosen set of source molecules, the **top
 4. **Selects the top-10** most similar targets per source. When several molecules tie at the lowest kept score and not all fit in the top-10, the kept tied rows are flagged with `has_duplicates_of_last_largest_score`.
 5. **Builds a data mart**: a dimension table of molecules and their properties (restricted to molecules the facts reference) and a fact table of source→target similarities with the tie flag, plus analytical views (see [Results](#results)).
 
-Inputs and outputs live under an S3 prefix of the form `final_task/<surname_name>`.
+Inputs and outputs live under an S3 prefix of your choosing, set via `S3_PREFIX` (e.g. `chembl/similarity`).
+
+> **A note on scale.** A full all-vs-all similarity over ChEMBL is an O(n²) problem that is not tractable on a single machine. This pipeline fingerprints the full corpus but computes similarity for a configurable subset of source molecules. The reasoning, benchmark, and the parameters that control it are in [Scale and compute limitations](#scale-and-compute-limitations).
 
 ## Architecture
 
@@ -36,22 +38,22 @@ Orchestrated end-to-end by Airflow (DAG id `chembl_similarity_pipeline`, defined
 ### Design decisions
 
 - **Full similarity table schema:** each source's full pairwise table is self-contained, with `source_chembl_id`, `target_chembl_id`, and `similarity_score` stored as real columns rather than being identified by filename alone.
-- **"10 source molecules" (view 8a):** a fixed set (first 10 by sorted `chembl_id`), not a different random 10 each run, so the pivot's column set is stable between runs.
-- **`cx_logp` and `molecular_species` are always NULL:** ChEMBL removed both before release 37 (the release ingested here). The columns are kept in the schema and populated as NULL rather than dropped, so the dimension keeps its specified shape.
+- **Fixed source set for the pivot:** the pivot view uses a fixed set of source molecules (first 10 by sorted `chembl_id`), not a different random 10 each run, so the pivot's column set is stable between runs.
+- **`cx_logp` and `molecular_species` are populated as NULL:** these two dimension columns are kept in the schema for shape but are not populated by ingestion. See the query in `workers/pipeline/ingest.py`; adjust there if your ChEMBL release supplies them and you want them carried through.
 
 ### Data mart and views
 
 **Dimension** (`dim_molecule`): one row per molecule with `chembl_id`, `molecule_type`, `mw_freebase`, `alogp`, `psa`, `cx_logp`, `molecular_species`, `full_mwt`, `aromatic_rings`, `heavy_atoms`. Restricted to molecules referenced by the fact table.
 
-**Fact** (`fact_similarity`): source molecule, target molecule, Tanimoto score, and the `has_duplicates_of_last_largest_score` flag. Holds the top-10 per source.
+**Fact** (`fact_similarity`): source molecule, target molecule, Tanimoto score, `rank_within_source`, and the `has_duplicates_of_last_largest_score` flag. Holds the top-10 per source.
 
-Five views sit on top (all over the top-10 subset; sample output in [Results](#results)):
+Five analytical views sit on top (all over the top-10 subset; sample output in [Results](#results)):
 
-- **7a**: average similarity score per source molecule.
-- **7b**: average deviation of a similar molecule's `alogp` from its source molecule's `alogp`.
-- **8a**: pivot with rows as target molecules, columns as the 10 chosen source molecules, cells as similarity scores.
-- **8b**: per row, the source, target, score, the next most similar target after this one, and the source's second most similar target overall.
-- **8c**: average similarity grouped four ways (per source; per source's aromatic-rings + heavy-atoms; per source's heavy-atoms; whole dataset), with aggregation NULLs shown as `TOTAL`, built with `GROUPING SETS` and no `UNION`.
+- `v7a_avg_similarity_per_source` — average similarity score per source molecule.
+- `v7b_avg_alogp_deviation` — average deviation of a similar molecule's `alogp` from its source molecule's `alogp` (both absolute and signed).
+- `v8a_similarity_pivot` — pivot with rows as target molecules, columns as the 10 fixed source molecules, cells as similarity scores. Generated at runtime (see Design decisions).
+- `v8b_next_and_second_target` — per row: the source, target, score, the next most similar target after this one, and the source's second most similar target overall.
+- `v8c_avg_similarity_grouped` — average similarity grouped four ways (per source; per source's aromatic-rings + heavy-atoms; per source's heavy-atoms; whole dataset), with aggregation NULLs shown as `TOTAL`, built with `GROUPING SETS` and no `UNION`.
 
 ### Performance and reliability decisions
 
@@ -59,14 +61,37 @@ The DWH sits in a private subnet reached through an AWS SSM tunnel. SSM is built
 
 - **Source molecules are picked inside the database.** `choose_source_molecules` samples in SQL (`ORDER BY md5(chembl_id || :seed) LIMIT :n`), so only the chosen rows cross the tunnel instead of all ~2.9M. Hashing with `RANDOM_SEED` keeps the choice random but reproducible.
 - **Bulk data moves in batches.** `_ingest_table` streams with `fetchmany` and `COPY`s each batch, so a dropped tunnel costs one batch, not the whole table.
-- **The fingerprint corpus loads once.** All sources are scored against a single in-memory matrix, instead of one container per source re-downloading the corpus. Fingerprints stay packed as `uint8` (0.69 GB, not 5.53 GB), keeping peak memory near 2 GB.
-- **Slow stages are cached and resumable.** The ChEMBL tarball, its extraction, and the fingerprint file are reused when still valid (guarded by completion markers and a manifest of `radius`/`n_bits`/row count). Per-source similarity results already on S3 are skipped, so an interrupted run resumes.
+- **The fingerprint corpus loads once.** All sources are scored against a single in-memory matrix, instead of one container per source re-downloading the corpus. Fingerprints stay packed as `uint8` (~0.69 GB, not ~5.5 GB), keeping peak memory near 2 GB.
+- **Slow stages are cached and resumable.** The ChEMBL tarball, its extraction, and the fingerprint file are reused when still valid (guarded by completion markers and a manifest of `radius`/`n_bits`/`sample_size`/row count). Per-source similarity results already on S3 are skipped, so an interrupted run resumes.
 - **Stale outputs are pruned.** Changing `N_SOURCE_MOLECULES` or `RANDOM_SEED` selects different molecules; old files are deleted first. This matters because `load_mart_from_s3` loads *every* `top10.parquet` under the prefix; one orphan would silently add a source to `fact_similarity`.
 
 ### Open assumptions
 
-- **View 8b** returns, for each row, two reference points: the *next* most similar target after the one in that row, and the *second* most similar target overall for that same source molecule. Both are ranked against the same source molecule the row belongs to, using positions within that source's own top-10 list. They are deliberately not computed as a chain from one target to the next: the rankings only exist for the chosen source molecules, so a molecule that appears only as a target has no ranked list of its own to continue a chain into.
+- **View `v8b`** returns, for each row, two reference points: the *next* most similar target after the one in that row, and the *second* most similar target overall for that same source molecule. Both are ranked against the same source molecule the row belongs to, using positions within that source's own top-10 list. They are deliberately not computed as a chain from one target to the next: the rankings only exist for the chosen source molecules, so a molecule that appears only as a target has no ranked list of its own to continue a chain into.
 - **Transaction isolation for similarity writes:** no elevated isolation level is needed, because the design removes the possibility of write conflicts rather than guarding against them. Similarity is computed one source at a time in a single worker, each source's results are written to a separate location, and one final step gathers them and loads the fact table in a single pass. Since no two writers ever touch the same rows, Postgres's default `READ COMMITTED` is sufficient.
+
+## Scale and compute limitations
+
+Computing similarity for *every* ChEMBL molecule against every other is an O(n²) problem. With ~2.9M structures in the corpus (an upper bound from `compound_structures`; the exact figure is written to the fingerprint manifest as `n_fingerprints`, and it moves with the ChEMBL release), that is on the order of 8 trillion Tanimoto comparisons.
+
+**Benchmark** (single thread, packed `uint8` fingerprints, one machine):
+
+| Workload                           | Comparisons    | Wall time | Output  |
+| ---------------------------------- | -------------- | --------- | ------- |
+| Measured (10k × 10k)              | 100 M          | 17.6 s    | 0.30 GB |
+| Extrapolated full matrix (n²)     | ~8.4 × 10¹² | ~17 days  | ~25 TB  |
+| Chosen subset (100 × full corpus) | ~2.9 × 10⁸   | ~1 min    | ~0.9 GB |
+
+Throughput is ~5.7M comparisons/s; output is ~3.0 bytes/comparison on disk; peak RSS is ~1 GB (the packed corpus is ~0.69 GB and must stay resident).
+
+**Why the full matrix is not run here.** At ~17 days of single-thread wall time and ~25 TB of output, it is impractical on one machine: the output alone exceeds what is reasonable to store and upload, and parallelism is bounded by RAM because every worker must hold the whole corpus, so adding workers does not shorten the wall-clock within these constraints.
+
+**What the pipeline does instead.**
+
+- **Fingerprints** are computed for the **full** compound set and stored once, so a later "find neighbours of one target molecule" query is cheap. This is the default.
+- **Similarity** is computed for a configurable **subset of `N_SOURCE_MOLECULES` source molecules** (default 100) against the full corpus, then reduced to top-10 per source.
+
+**Controlling the corpus size for local runs.** `FINGERPRINT_SAMPLE_SIZE` (unset by default) caps fingerprinting to a reproducible random sample of that many structures, for fast iteration on a laptop. Sample selection is deterministic for a given `RANDOM_SEED`. Note that when a sample is used, `choose_source_molecules` still draws from the full warehouse, so a chosen source may fall outside the sampled corpus and fail with "has no fingerprint in Silver"; for a coherent end-to-end sample run keep `N_SOURCE_MOLECULES` small and expect the corpus to be a subset. Leave `FINGERPRINT_SAMPLE_SIZE` unset for full, production-shaped runs.
 
 ## Repository layout
 
@@ -83,9 +108,9 @@ dags/chembl_molecule_similarity_pipeline/
 workers/
   pipeline/
     ingest.py                # chembl_downloader -> bronze (S3 parquet + Postgres raw schema)
-    fingerprints.py          # RDKit Morgan fingerprints -> S3 silver
+    fingerprints.py          # RDKit Morgan fingerprints -> S3 silver (full corpus or sample)
     similarity.py            # Tanimoto similarity, top-10 + duplicate flag
-    mart_load.py             # loads dim_molecule / fact_similarity, regenerates the 8a pivot
+    mart_load.py             # loads dim_molecule / fact_similarity, regenerates the pivot
     s3_utils.py              # S3 client + parquet/json helpers (explicit-credential session)
     db_utils.py              # DWH connection helper
     config.py                # env-driven Settings + validation
@@ -97,8 +122,8 @@ workers/
 sql/
   01_schema_raw.sql          # bronze schema DDL
   02_schema_mart.sql         # gold schema DDL (dim_molecule, fact_similarity)
-  03_views_basic.sql         # 7a, 7b
-  04_views_advanced.sql      # 8b, 8c (8a is generated at runtime, see Design decisions)
+  03_views_basic.sql         # avg-similarity + alogp-deviation views
+  04_views_advanced.sql      # next/second-target + grouped-average views (pivot generated at runtime)
 tests/
   test_config.py             # settings validation + S3 layer-prefix contract
   test_fingerprints.py       # Morgan generation, packing contract, determinism
@@ -159,7 +184,6 @@ $env:PGPASSWORD = (Get-Content dags/chembl_molecule_similarity_pipeline/.env |
 ```powershell
 # Worker image (used by every compute task)
 docker build -t pipeline_worker ./workers
-
 # Airflow stack + tunnel + keepalive
 docker compose -f dags/chembl_molecule_similarity_pipeline/docker-compose.airflow.yml `
   --env-file dags/chembl_molecule_similarity_pipeline/.env up -d --build
@@ -241,24 +265,25 @@ Grouped by what reads them. Everything lives in `.env` (see `.env.example`); not
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | Temporary SSO credentials from`aws configure export-credentials`. boto3 uses these for S3 (the ambient `AWS_PROFILE` is deliberately ignored; see Credential safety) |
 | `S3_BUCKET`                                                             | Object-store bucket for Bronze/Silver Parquet                                                                                                                            |
 | `S3_REGION`                                                             | AWS region the bucket lives in (default`us-east-1` if unset)                                                                                                           |
-| `S3_PREFIX`                                                             | Namespace within the bucket, e.g.`final_task/<surname_name>`                                                                                                           |
+| `S3_PREFIX`                                                             | Namespace within the bucket, e.g.`chembl/similarity`                                                                                                                   |
 | `DWH_URL`                                                               | Postgres connection string for the DWH (host stays`host.docker.internal` so containers reach it via the tunnel)                                                        |
 | `PGPASSWORD`                                                            | Same password as in`DWH_URL`, for manual `psql`/DDL sessions                                                                                                         |
 
 **Pipeline parameters**
 
-| Variable                              | Purpose                                                                                                              |
-| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `N_SOURCE_MOLECULES`                | Number of source molecules to sample. Default`100`                                                                 |
-| `TOP_K`                             | Neighbours kept per source. Default`10`; read by the DAG and `verify_outputs.py`                                 |
-| `RANDOM_SEED`                       | Fixed seed for reproducible source selection. Default`42`                                                          |
-| `FINGERPRINTS_FORCE_RECOMPUTE`      | Set`1` to ignore the fingerprint manifest and recompute from scratch                                               |
-| `INGEST_MIN_FREE_BYTES`             | Disk the extraction preflight requires. Default 50 GiB                                                               |
-| `INGEST_DOWNLOAD_MAX_ATTEMPTS`      | Resumable-download retries. Default 10                                                                               |
-| `INGEST_DOWNLOAD_RETRY_DELAY`       | Seconds between download retries. Default 15                                                                         |
-| `INGEST_DOWNLOAD_SOCKET_TIMEOUT`    | Socket timeout for the ChEMBL download, seconds. Default 120                                                         |
-| `INGEST_EXTRACTION_TIMEOUT_SECONDS` | Ceiling on SQLite extraction before failing loudly. Default 7200 (2h)                                                |
-| `PYSTOW_HOME`                       | Where the ChEMBL tarball and its extraction are cached. Default`~/.data`; point at a larger disk if space is tight |
+| Variable                              | Purpose                                                                                                                                                                                                                                |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `N_SOURCE_MOLECULES`                | Number of source molecules to sample. Default`100`                                                                                                                                                                                   |
+| `TOP_K`                             | Neighbours kept per source. Default`10`; read by the DAG and `verify_outputs.py`                                                                                                                                                   |
+| `RANDOM_SEED`                       | Fixed seed for reproducible source and fingerprint-sample selection. Default`42`                                                                                                                                                     |
+| `FINGERPRINT_SAMPLE_SIZE`           | Unset (default) fingerprints the full compound set. Set to a positive integer to fingerprint only a reproducible random sample of that size for fast local/dev runs. See[Scale and compute limitations](#scale-and-compute-limitations) |
+| `FINGERPRINTS_FORCE_RECOMPUTE`      | Set`1` to ignore the fingerprint manifest and recompute from scratch                                                                                                                                                                 |
+| `INGEST_MIN_FREE_BYTES`             | Disk the extraction preflight requires. Default 50 GiB                                                                                                                                                                                 |
+| `INGEST_DOWNLOAD_MAX_ATTEMPTS`      | Resumable-download retries. Default 10                                                                                                                                                                                                 |
+| `INGEST_DOWNLOAD_RETRY_DELAY`       | Seconds between download retries. Default 15                                                                                                                                                                                           |
+| `INGEST_DOWNLOAD_SOCKET_TIMEOUT`    | Socket timeout for the ChEMBL download, seconds. Default 120                                                                                                                                                                           |
+| `INGEST_EXTRACTION_TIMEOUT_SECONDS` | Ceiling on SQLite extraction before failing loudly. Default 7200 (2h)                                                                                                                                                                  |
+| `PYSTOW_HOME`                       | Where the ChEMBL tarball and its extraction are cached. Default`~/.data`; point at a larger disk if space is tight                                                                                                                   |
 
 **SSM tunnel (`ssm_tunnel` container only)**
 
@@ -285,7 +310,7 @@ Grouped by what reads them. Everything lives in `.env` (see `.env.example`); not
 
 ## Results
 
-Figures below are from a full run over ChEMBL 37 with `N_SOURCE_MOLECULES=100`, `RANDOM_SEED=42`.
+Figures below are from a full run over ChEMBL (release pinned by `chembl_downloader.latest()`) with `N_SOURCE_MOLECULES=100`, `RANDOM_SEED=42`, `FINGERPRINT_SAMPLE_SIZE` unset (full corpus).
 Reproduce with `scripts/verify_outputs.py` (see [Verifying a run](#verifying-a-run)).
 
 ### Volumes
@@ -353,7 +378,7 @@ Reproduce with `scripts/verify_outputs.py` (see [Verifying a run](#verifying-a-r
 
 ### Similarity pivot (`mart.v8a_similarity_pivot`), 100 rows x 10 source columns
 
-First column is the target molecule; each remaining column is one of the 10 chosen source molecules; cells are similarity scores (NULL where that target is not in that source's top-10). Abridged to 4 source columns for width (columns chosen to show representative non-NULL cells, not the leftmost four):
+First column is the target molecule; each remaining column is one of the 10 fixed source molecules; cells are similarity scores (NULL where that target is not in that source's top-10). Abridged to 4 source columns for width (columns chosen to show representative non-NULL cells, not the leftmost four):
 
 | target_chembl_id | CHEMBL10528 | CHEMBL1185749      | CHEMBL1203657      | CHEMBL1321029 |
 | ---------------- | ----------- | ------------------ | ------------------ | ------------- |
@@ -365,13 +390,13 @@ First column is the target molecule; each remaining column is one of the 10 chos
 
 ### Next and second most similar target (`mart.v8b_next_and_second_target`), 1,000 rows
 
-| source_chembl_id | target_chembl_id | similarity_score   | next_most_similar_target | second_most_similar_target |
-| ---------------- | ---------------- | ------------------ | ------------------------ | -------------------------- |
-| CHEMBL10528      | CHEMBL9788       | 0.6153846153846154 | CHEMBL1620120            | CHEMBL1620120              |
-| CHEMBL10528      | CHEMBL1620120    | 0.6140350877192983 | CHEMBL9603               | CHEMBL1620120              |
-| CHEMBL10528      | CHEMBL9603       | 0.6140350877192983 | CHEMBL269173             | CHEMBL1620120              |
-| CHEMBL10528      | CHEMBL269173     | 0.609375           | CHEMBL1415873            | CHEMBL1620120              |
-| CHEMBL10528      | CHEMBL1415873    | 0.603448275862069  | CHEMBL275917             | CHEMBL1620120              |
+| source_chembl_id | target_chembl_id | similarity_score   | next_most_similar_target_chembl_id | second_most_similar_target_chembl_id |
+| ---------------- | ---------------- | ------------------ | ---------------------------------- | ------------------------------------ |
+| CHEMBL10528      | CHEMBL9788       | 0.6153846153846154 | CHEMBL1620120                      | CHEMBL1620120                        |
+| CHEMBL10528      | CHEMBL1620120    | 0.6140350877192983 | CHEMBL9603                         | CHEMBL1620120                        |
+| CHEMBL10528      | CHEMBL9603       | 0.6140350877192983 | CHEMBL269173                       | CHEMBL1620120                        |
+| CHEMBL10528      | CHEMBL269173     | 0.609375           | CHEMBL1415873                      | CHEMBL1620120                        |
+| CHEMBL10528      | CHEMBL1415873    | 0.603448275862069  | CHEMBL275917                       | CHEMBL1620120                        |
 
 ### Grouped averages (`mart.v8c_avg_similarity_grouped`), 188 rows
 
