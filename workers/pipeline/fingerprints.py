@@ -80,6 +80,14 @@ def _fingerprints_cache_is_valid(settings: Settings, s3_key: str, manifest_key: 
         )
         return False
 
+    if manifest.get("sample_size") != settings.fingerprint_sample_size:
+        logger.info(
+            "Cached fingerprints were built with sample_size=%s but settings ask for "
+            "sample_size=%s; recomputing",
+            manifest.get("sample_size"), settings.fingerprint_sample_size,
+        )
+        return False
+
     current_count = _eligible_molecule_count(settings)
     if manifest.get("source_row_count") != current_count:
         logger.info(
@@ -107,20 +115,37 @@ def compute_fingerprints(settings: Settings | None = None) -> str:
     if _fingerprints_cache_is_valid(settings, s3_key, manifest_key):
         return f"s3://{settings.s3_bucket}/{s3_key}"
 
+    # Recorded in the manifest regardless of sampling, so cache validity tracks
+    # Bronze changes even when only a sample is materialised.
+    full_eligible = _eligible_molecule_count(settings)
+
+    base_query = """
+        -- RDKit parses '' into a valid zero-atom molecule, which would
+        -- yield an all-zero fingerprint counted as valid, so exclude it
+        -- here rather than relying on IS NOT NULL alone.
+        SELECT md.chembl_id, cs.canonical_smiles
+        FROM raw.compound_structures cs
+        JOIN raw.molecule_dictionary md ON md.chembl_id = cs.chembl_id
+        WHERE cs.canonical_smiles IS NOT NULL
+          AND cs.canonical_smiles <> ''
+    """
+
     with get_connection(settings) as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                -- RDKit parses '' into a valid zero-atom molecule, which would
-                -- yield an all-zero fingerprint counted as valid, so exclude it
-                -- here rather than relying on IS NOT NULL alone.
-                SELECT md.chembl_id, cs.canonical_smiles
-                FROM raw.compound_structures cs
-                JOIN raw.molecule_dictionary md ON md.chembl_id = cs.chembl_id
-                WHERE cs.canonical_smiles IS NOT NULL
-                  AND cs.canonical_smiles <> ''
-                """
-            )
+            if settings.fingerprint_sample_size is not None:
+                logger.info(
+                    "FINGERPRINT_SAMPLE_SIZE=%s set; fingerprinting a reproducible sample "
+                    "of at most %s of %s eligible structures (seed=%s)",
+                    settings.fingerprint_sample_size, settings.fingerprint_sample_size,
+                    full_eligible, settings.random_seed,
+                )
+                # Deterministic hash-ordered sample: same seed + data -> same rows.
+                cur.execute(
+                    base_query + " ORDER BY md5(md.chembl_id || %s) LIMIT %s",
+                    (str(settings.random_seed), settings.fingerprint_sample_size),
+                )
+            else:
+                cur.execute(base_query)
             rows = cur.fetchall()
 
     chembl_ids: list[str] = []
@@ -157,7 +182,9 @@ def compute_fingerprints(settings: Settings | None = None) -> str:
         {
             "radius": settings.morgan_radius,
             "n_bits": settings.morgan_n_bits,
-            "source_row_count": len(rows),
+            "sample_size": settings.fingerprint_sample_size,
+            "source_row_count": full_eligible,
+            "n_selected_for_fingerprinting": len(rows),
             "n_fingerprints": len(chembl_ids),
             "n_invalid_smiles": n_invalid,
         },
@@ -203,6 +230,7 @@ def seed_fingerprint_manifest(settings: Settings | None = None, verify_file: boo
     manifest = {
         "radius": settings.morgan_radius,
         "n_bits": settings.morgan_n_bits,
+        "sample_size": settings.fingerprint_sample_size,
         "source_row_count": source_row_count,
         "n_fingerprints": n_fingerprints,
         "seeded": True,
