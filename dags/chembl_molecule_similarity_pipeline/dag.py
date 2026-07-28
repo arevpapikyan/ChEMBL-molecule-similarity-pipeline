@@ -194,7 +194,7 @@ with DAG(
     start_date=datetime(2026, 1, 1),
     catchup=False,
     default_args=default_args,
-    tags=["chembl", "similarity", "de-school-2026"],
+    tags=["chembl", "similarity"],
     max_active_runs=1,
 ):
 
