@@ -19,13 +19,25 @@ DOCKER_IMAGE = "pipeline_worker"
 # The allowlist of variables forwarded INTO the spawned worker containers -- not
 # the pipeline's whole config.
 WORKER_ENV_VARS = [
-    "S3_BUCKET", "S3_PREFIX", "S3_REGION",
-    "DWH_URL", "N_SOURCE_MOLECULES", "RANDOM_SEED", "TOP_K",
-    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+    "S3_BUCKET",
+    "S3_PREFIX",
+    "S3_REGION",
+    "DWH_URL",
+    "N_SOURCE_MOLECULES",
+    "RANDOM_SEED",
+    "TOP_K",
+    "FINGERPRINT_SAMPLE_SIZE",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
 ]
 
 # Variables the DAG itself needs present, whatever the deployment.
-REQUIRED_ENV_VARS = ["S3_BUCKET", "S3_PREFIX", "DWH_URL"]
+REQUIRED_ENV_VARS = [
+    "S3_BUCKET",
+    "S3_PREFIX",
+    "DWH_URL"
+    ]
 
 
 def worker_env() -> dict:
