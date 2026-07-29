@@ -41,6 +41,14 @@ def captured_writes(monkeypatch):
     return writes
 
 
+@pytest.fixture
+def stable_corpus(monkeypatch):
+    """Pin the fingerprint-corpus token so cached similarity outputs stay valid."""
+    monkeypatch.setattr(f"{MODULE}._fingerprint_corpus_token", lambda s: "T")
+    monkeypatch.setattr(f"{MODULE}.read_json", lambda s, key: {"corpus_token": "T"})
+    monkeypatch.setattr(f"{MODULE}.write_json", lambda s, obj, key: f"s3://{s.s3_bucket}/{key}")
+
+
 def _packed(rows: list[list[int]]) -> np.ndarray:
     return np.packbits(np.array(rows, dtype=np.uint8), axis=1)
 
@@ -136,7 +144,7 @@ def test_score_one_source_raises_a_clear_error_for_an_unknown_source(settings, c
         _score_one_source("CHEMBL_MISSING", ["CHEMBL1"], _packed([[1, 0, 0, 0]]), 4, settings)
 
 
-def test_already_present_sources_are_skipped(monkeypatch, settings, captured_writes):
+def test_already_present_sources_are_skipped(monkeypatch, settings, captured_writes, stable_corpus):
     monkeypatch.setattr(
         f"{MODULE}.list_keys",
         lambda s, prefix: ["any/source_chembl_id=CHEMBL1/full.parquet"],
@@ -152,7 +160,7 @@ def test_already_present_sources_are_skipped(monkeypatch, settings, captured_wri
     assert captured_writes == []
 
 
-def test_skip_existing_disabled_recomputes_everything(monkeypatch, settings, captured_writes):
+def test_skip_existing_disabled_recomputes_everything(monkeypatch, settings, captured_writes, stable_corpus):
     monkeypatch.setattr(
         f"{MODULE}.list_keys",
         lambda s, prefix: ["any/source_chembl_id=CHEMBL1/full.parquet"],
@@ -169,7 +177,7 @@ def test_skip_existing_disabled_recomputes_everything(monkeypatch, settings, cap
     assert len(captured_writes) == 1
 
 
-def test_batch_scoring_matches_single_source_scoring(monkeypatch, settings, captured_writes):
+def test_batch_scoring_matches_single_source_scoring(monkeypatch, settings, captured_writes, stable_corpus):
     """The batch path must produce byte-identical output to the single-source path."""
     chembl_ids = ["CHEMBL1", "CHEMBL2", "CHEMBL3"]
     packed = _packed([[1, 1, 0, 0], [1, 0, 0, 0], [0, 0, 1, 1]])
@@ -246,3 +254,51 @@ def test_select_top_k_similarity_scores_are_plain_floats(monkeypatch, settings, 
     result = select_top_k("CHEMBL1", k=10, settings=settings)
 
     assert all(isinstance(v, float) for v in result.column("similarity_score").to_pylist())
+
+
+def test_missing_source_fingerprint_fails_fast_without_deleting(
+    monkeypatch, settings, captured_writes
+):
+    """An under-sized sample must raise clearly and NOT prune good existing outputs."""
+    monkeypatch.setattr(f"{MODULE}._fingerprint_corpus_token", lambda s: "NEW")
+    monkeypatch.setattr(f"{MODULE}.read_json", lambda s, key: None)  # no marker yet
+    monkeypatch.setattr(f"{MODULE}.write_json", lambda s, obj, key: None)
+    monkeypatch.setattr(
+        f"{MODULE}._load_packed_matrix",
+        lambda s: (["CHEMBL1"], _packed([[1, 0, 0, 0]]), 4),
+    )
+    monkeypatch.setattr(f"{MODULE}.list_keys", lambda s, prefix: [])
+
+    def explode(s, ks):
+        raise AssertionError("must not delete outputs when a source is missing from the corpus")
+
+    monkeypatch.setattr(f"{MODULE}.delete_keys", explode)
+
+    with pytest.raises(ValueError, match="no fingerprint in the current corpus"):
+        compute_similarity_for_all_sources(["CHEMBL1", "CHEMBL_MISSING"], settings)
+    assert captured_writes == []
+
+
+def test_corpus_change_invalidates_and_recomputes_all(monkeypatch, settings, captured_writes):
+    """A changed fingerprint corpus recomputes everything, ignoring stale cache."""
+    monkeypatch.setattr(f"{MODULE}._fingerprint_corpus_token", lambda s: "NEW")
+    monkeypatch.setattr(f"{MODULE}.read_json", lambda s, key: {"corpus_token": "OLD"})
+    written = []
+    monkeypatch.setattr(f"{MODULE}.write_json", lambda s, obj, key: written.append(obj) or "s3://x")
+    monkeypatch.setattr(
+        f"{MODULE}.list_keys",
+        lambda s, prefix: ["any/source_chembl_id=CHEMBL1/full.parquet"],
+    )
+    pruned = []
+    monkeypatch.setattr(f"{MODULE}.delete_keys", lambda s, ks: pruned.extend(ks) or len(ks))
+    monkeypatch.setattr(
+        f"{MODULE}._load_packed_matrix",
+        lambda s: (["CHEMBL1", "CHEMBL2"], _packed([[1, 1, 0, 0], [1, 0, 0, 0]]), 4),
+    )
+
+    uris = compute_similarity_for_all_sources(["CHEMBL1"], settings)
+
+    assert len(uris) == 1  # recomputed despite an existing CHEMBL1 output
+    assert len(captured_writes) == 1
+    assert pruned == ["any/source_chembl_id=CHEMBL1/full.parquet"]  # stale output dropped
+    assert written[-1] == {"corpus_token": "NEW"}  # marker refreshed to the new corpus

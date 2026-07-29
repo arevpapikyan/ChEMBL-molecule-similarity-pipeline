@@ -4,11 +4,16 @@ import numpy as np
 import pyarrow as pa
 
 from .config import Settings, get_settings
-from .s3_utils import delete_keys, list_keys, read_parquet, write_parquet
+from .s3_utils import delete_keys, list_keys, read_json, read_parquet, write_json, write_parquet
 
 logger = logging.getLogger(__name__)
 
 TOPK_PREFIX = "silver/topk"
+
+# Identity marker written beside the per-source similarity outputs, recording the
+# fingerprint corpus they were computed against (see _fingerprint_corpus_token).
+FINGERPRINT_MANIFEST_NAME = "fingerprints.manifest.json"
+SIMILARITY_CORPUS_MARKER = "_corpus.json"
 
 # Lookup table for counting set bits in packed fingerprint bytes.
 _POPCOUNT = np.unpackbits(np.arange(256, dtype=np.uint8)[:, None], axis=1).sum(axis=1).astype(np.uint16)
@@ -128,44 +133,116 @@ def _prune_orphaned_outputs(settings: Settings, prefix: str, keep: set[str]) -> 
     return delete_keys(settings, orphans)
 
 
+def _fingerprint_corpus_token(settings: Settings) -> str:
+    """Identity of the fingerprint corpus the similarity outputs must match.
+
+    Derived from the fingerprint manifest so it changes whenever the
+    fingerprinted set changes -- sample size, seed, molecule count, or the
+    Morgan parameters. Used to invalidate cached similarity outputs that were
+    computed against a different corpus (e.g. a full run then a sample run).
+    """
+    manifest = read_json(
+        settings, f"{settings.silver_fingerprints_prefix}/{FINGERPRINT_MANIFEST_NAME}"
+    )
+    if not manifest:
+        return "unknown"
+    parts = (
+        manifest.get("sample_size"),
+        manifest.get("random_seed"),
+        manifest.get("n_fingerprints"),
+        manifest.get("radius"),
+        manifest.get("n_bits"),
+    )
+    return "|".join(str(p) for p in parts)
+
+
+def _guard_sources_in_corpus(source_chembl_ids: list[str], corpus_ids: list[str]) -> None:
+    """Fail loudly if any source lacks a fingerprint, instead of deep in the loop."""
+    corpus = set(corpus_ids)
+    missing = [s for s in source_chembl_ids if s not in corpus]
+    if missing:
+        raise ValueError(
+            f"{len(missing)} of {len(source_chembl_ids)} source molecule(s) have no "
+            f"fingerprint in the current corpus of {len(corpus)} molecule(s) "
+            f"(e.g. {missing[:5]}). Sources are chosen from all of Bronze, not from the "
+            "fingerprint sample, so this usually means FINGERPRINT_SAMPLE_SIZE is set "
+            "smaller than the source set. Unset FINGERPRINT_SAMPLE_SIZE for a full run, "
+            "or set it above N_SOURCE_MOLECULES."
+        )
+
+
 def compute_similarity_for_all_sources(
     source_chembl_ids: list[str],
     settings: Settings | None = None,
     skip_existing: bool = True,
 ) -> list[str]:
     settings = settings or get_settings()
+    sim_prefix = f"{settings.silver_similarity_prefix}/"
+    marker_key = f"{settings.silver_similarity_prefix}/{SIMILARITY_CORPUS_MARKER}"
 
-    # Drop outputs for sources that are no longer selected, so this prefix ends
-    # up containing exactly the current source set.
-    _prune_orphaned_outputs(
-        settings, f"{settings.silver_similarity_prefix}/", set(source_chembl_ids)
-    )
+    current_token = _fingerprint_corpus_token(settings)
+    stored = read_json(settings, marker_key) or {}
+    corpus_changed = stored.get("corpus_token") != current_token
+    if corpus_changed and stored:
+        logger.info(
+            "Fingerprint corpus changed (marker=%s, current=%s); invalidating cached "
+            "similarity outputs and recomputing.",
+            stored.get("corpus_token"), current_token,
+        )
 
-    already: set[str] = set()
-    if skip_existing:
-        for key in list_keys(settings, f"{settings.silver_similarity_prefix}/"):
-            source = _source_id_from_key(key)
-            if source is not None:
-                already.add(source)
+    chembl_ids = packed = n_bits = None
 
-    todo = [s for s in source_chembl_ids if s not in already]
+    if corpus_changed:
+        # Load the corpus and verify every source is present BEFORE deleting any
+        # existing outputs, so a bad run (e.g. an under-sized sample) fails loudly
+        # without first destroying good results from the previous corpus.
+        chembl_ids, packed, n_bits = _load_packed_matrix(settings)
+        logger.info(
+            "Loaded fingerprint matrix once: %d molecules x %d bits (%.2f GB packed)",
+            len(chembl_ids), n_bits, packed.nbytes / 1024**3,
+        )
+        _guard_sources_in_corpus(source_chembl_ids, chembl_ids)
+
+        # The corpus differs, so nothing already on S3 is valid: drop it all.
+        _prune_orphaned_outputs(settings, sim_prefix, set())
+        todo = list(source_chembl_ids)
+    else:
+        # Drop outputs for sources no longer selected, so this prefix ends up
+        # containing exactly the current source set.
+        _prune_orphaned_outputs(settings, sim_prefix, set(source_chembl_ids))
+
+        already: set[str] = set()
+        if skip_existing:
+            for key in list_keys(settings, sim_prefix):
+                source = _source_id_from_key(key)
+                if source is not None:
+                    already.add(source)
+        todo = [s for s in source_chembl_ids if s not in already]
+
     logger.info(
-        "compute_similarity: %d sources requested, %d already present, %d to compute",
-        len(source_chembl_ids), len(source_chembl_ids) - len(todo), len(todo),
+        "compute_similarity: %d requested, %d reused, %d to compute (corpus=%s)",
+        len(source_chembl_ids), len(source_chembl_ids) - len(todo), len(todo), current_token,
     )
+
     if not todo:
+        # Refresh the marker so it records the corpus these cached outputs match.
+        write_json(settings, {"corpus_token": current_token}, marker_key)
         return []
 
-    chembl_ids, packed, n_bits = _load_packed_matrix(settings)
-    logger.info(
-        "Loaded fingerprint matrix once: %d molecules x %d bits (%.2f GB packed)",
-        len(chembl_ids), n_bits, packed.nbytes / 1024**3,
-    )
+    if chembl_ids is None:
+        chembl_ids, packed, n_bits = _load_packed_matrix(settings)
+        logger.info(
+            "Loaded fingerprint matrix once: %d molecules x %d bits (%.2f GB packed)",
+            len(chembl_ids), n_bits, packed.nbytes / 1024**3,
+        )
+        _guard_sources_in_corpus(todo, chembl_ids)
 
     uris: list[str] = []
     for i, source in enumerate(todo, start=1):
         uris.append(_score_one_source(source, chembl_ids, packed, n_bits, settings))
         logger.info("Scored source %d/%d (%s)", i, len(todo), source)
+
+    write_json(settings, {"corpus_token": current_token}, marker_key)
     return uris
 
 
