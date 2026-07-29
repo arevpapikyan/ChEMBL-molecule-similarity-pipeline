@@ -119,10 +119,16 @@ def build_failure_quiz_card(
                 "style": "attention",
                 "bleed": True,
                 "items": [
-                    {"type": "TextBlock", "text": "\U0001f6a9 PIPELINE FAILURE \U0001f6a9 POP QUIZ \U0001f6a9",
-                     "weight": "Bolder", "size": "Large", "wrap": True},
-                    {"type": "TextBlock", "text": f"{dag_id} \u00b7 {task_id} \u00b7 {when}",
-                     "isSubtle": True, "spacing": "None", "wrap": True},
+                    {
+                        "type": "TextBlock",
+                        "text": "\U0001f6a9 PIPELINE FAILURE \U0001f6a9 POP QUIZ \U0001f6a9",
+                        "weight": "Bolder", "size": "Large", "wrap": True
+                    },
+                    {
+                        "type": "TextBlock",
+                        "text": f"{dag_id} \u00b7 {task_id} \u00b7 {when}",
+                        "isSubtle": True, "spacing": "None", "wrap": True
+                    },
                 ],
             },
             {"type": "TextBlock", "text": "It failed. Why? Choose one:",
