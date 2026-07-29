@@ -191,7 +191,7 @@ docker compose -f dags/chembl_molecule_similarity_pipeline/docker-compose.airflo
 
 Open `http://localhost:8080` and log in with `admin`/`admin` (configurable via `_AIRFLOW_WWW_USER_USERNAME` / `_AIRFLOW_WWW_USER_PASSWORD`).
 
-**After editing `.env` or `dag.py`, recreate the containers, do not just restart them.** `docker compose restart` reuses the already-loaded environment and your change silently won't apply:
+`.env`, compose, or image changes require recreating the containers (`down`/`up`), not `restart`. Environment variables are injected when a container is created, so `docker compose restart` reuses the already-loaded environment and your change silently won't apply. DAG code changes don't need this, since the scheduler reparses the dags folder on its own every ~30s and picks them up live. The one exception is when a `dag.py` change also introduces a new environment variable: the code reparses, but the variable won't be present until you recreate, so recreate then too.
 
 ```powershell
 docker compose -f dags/chembl_molecule_similarity_pipeline/docker-compose.airflow.yml down
