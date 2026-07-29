@@ -10,6 +10,7 @@ import psycopg2
 import requests
 from airflow.providers.docker.operators.docker import DockerOperator
 from airflow.sdk import DAG, task
+from chembl_molecule_similarity_pipeline.teams_cards import build_failure_quiz_card
 from docker.types import Mount
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,7 @@ def _require_env() -> None:
             "env_file (.env); under another deployment supply them another way."
         )
     # TEAMS_WEBHOOK_URL is required unless alerting was explicitly opted out.
-    alerts_optional = os.environ.get("TEAMS_ALERTS_OPTIONAL", "").lower() in ("1", "true", "yes")
+    alerts_optional = os.environ.get("TEAMS_ALERTS_OPTIONAL", "").lower() == "true"
     if not alerts_optional and not os.environ.get("TEAMS_WEBHOOK_URL"):
         raise RuntimeError(
             "TEAMS_WEBHOOK_URL is not set, so pipeline failures cannot be "
@@ -172,21 +173,18 @@ def _post_to_teams(payload: dict) -> None:
 
 
 def notify_failure(context) -> None:
-    """Posts a failure card to Teams."""
+    """Posts a 'pop quiz' failure card to Teams (card built in teams_cards)."""
     ti = context["task_instance"]
     exc = context.get("exception")
-    reason = type(exc).__name__ if exc is not None else "Unknown (no exception object)"
+    real_error = f"{type(exc).__name__}: {exc}" if exc is not None else "Unknown error"
     map_index_suffix = f" (map_index={ti.map_index})" if ti.map_index != -1 else ""
 
-    _post_to_teams(_adaptive_card(
-        "ChEMBL pipeline task failed",
-        [
-            ("DAG", ti.dag_id),
-            ("Task", f"{ti.task_id}{map_index_suffix}"),
-            ("Attempt", str(ti.try_number)),
-            ("Error", reason),
-        ],
-        f"Run: {context['run_id']}",
+    _post_to_teams(build_failure_quiz_card(
+        dag_id=ti.dag_id,
+        task_id=f"{ti.task_id}{map_index_suffix}",
+        when=str(context.get("ts") or context.get("run_id", "")),
+        real_error=real_error,
+        submitted_by=os.environ.get("DAG_OWNER", "unknown"),
     ))
 
 
