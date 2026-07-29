@@ -49,11 +49,11 @@ Orchestrated end-to-end by Airflow (DAG id `chembl_similarity_pipeline`, defined
 
 Five analytical views sit on top (all over the top-10 subset; sample output in [Results](#results)):
 
-- `v7a_avg_similarity_per_source` — average similarity score per source molecule.
-- `v7b_avg_alogp_deviation` — average deviation of a similar molecule's `alogp` from its source molecule's `alogp` (both absolute and signed).
-- `v8a_similarity_pivot` — pivot with rows as target molecules, columns as the 10 fixed source molecules, cells as similarity scores. Generated at runtime (see Design decisions).
-- `v8b_next_and_second_target` — per row: the source, target, score, the next most similar target after this one, and the source's second most similar target overall.
-- `v8c_avg_similarity_grouped` — average similarity grouped four ways (per source; per source's aromatic-rings + heavy-atoms; per source's heavy-atoms; whole dataset), with aggregation NULLs shown as `TOTAL`, built with `GROUPING SETS` and no `UNION`.
+- `v7a_avg_similarity_per_source`: average similarity score per source molecule.
+- `v7b_avg_alogp_deviation`: average deviation of a similar molecule's `alogp` from its source molecule's `alogp` (both absolute and signed).
+- `v8a_similarity_pivot`: pivot with rows as target molecules, columns as the 10 fixed source molecules, cells as similarity scores. Generated at runtime (see Design decisions).
+- `v8b_next_and_second_target`: per row: the source, target, score, the next most similar target after this one, and the source's second most similar target overall.
+- `v8c_avg_similarity_grouped`: average similarity grouped four ways (per source; per source's aromatic-rings + heavy-atoms; per source's heavy-atoms; whole dataset), with aggregation NULLs shown as `TOTAL`, built with `GROUPING SETS` and no `UNION`.
 
 ### Performance and reliability decisions
 
@@ -63,7 +63,7 @@ The DWH sits in a private subnet reached through an AWS SSM tunnel. SSM is built
 - **Bulk data moves in batches.** `_ingest_table` streams with `fetchmany` and `COPY`s each batch, so a dropped tunnel costs one batch, not the whole table.
 - **The fingerprint corpus loads once.** All sources are scored against a single in-memory matrix, instead of one container per source re-downloading the corpus. Fingerprints stay packed as `uint8` (~0.69 GB, not ~5.5 GB), keeping peak memory near 2 GB.
 - **Slow stages are cached and resumable.** The ChEMBL tarball, its extraction, and the fingerprint file are reused when still valid (guarded by completion markers and a manifest of `radius`/`n_bits`/`sample_size`/row count). Per-source similarity results already on S3 are skipped, so an interrupted run resumes.
-- **Stale outputs are pruned.** Changing `N_SOURCE_MOLECULES` or `RANDOM_SEED` selects different molecules; old files are deleted first. This matters because `load_mart_from_s3` loads *every* `top10.parquet` under the prefix; one orphan would silently add a source to `fact_similarity`.
+- **Stale outputs are pruned, and invalidated when the corpus changes.** Changing `N_SOURCE_MOLECULES` or `RANDOM_SEED` selects different molecules; old files are deleted first. This matters because `load_mart_from_s3` loads *every* `top10.parquet` under the prefix, so one orphan would silently add a source to `fact_similarity`. Separately, the per-source similarity outputs record a token identifying the fingerprint corpus they were built against (sample size, seed, count, Morgan params); if the current corpus no longer matches, for example when switching between a full run and a sample, the cached outputs are recomputed rather than reused, so the mart can never mix results from two different corpora.
 
 ### Open assumptions
 
@@ -84,14 +84,14 @@ Computing similarity for *every* ChEMBL molecule against every other is an O(n²
 
 Throughput is ~5.7M comparisons/s; output is ~3.0 bytes/comparison on disk; peak RSS is ~1 GB (the packed corpus is ~0.69 GB and must stay resident).
 
-**Why the full matrix is not run here.** At ~17 days of single-thread wall time and ~25 TB of output, it is impractical on one machine: the output alone exceeds what is reasonable to store and upload, and parallelism is bounded by RAM because every worker must hold the whole corpus, so adding workers does not shorten the wall-clock within these constraints.
+**Why the full matrix is not run here.** At ~17 days of single-thread wall time and ~25 TB of output, it is impractical on one machine: the output alone exceeds what is reasonable to store and upload, and parallelism is bounded by RAM because every worker must hold the whole corpus, so adding workers does not shorten the wall-clock within these constraints. Distributing across a cluster, GPU Tanimoto kernels, or LSH/MinHash blocking to prune candidate pairs before exact scoring would all help, but none are set up here.
 
 **What the pipeline does instead.**
 
 - **Fingerprints** are computed for the **full** compound set and stored once, so a later "find neighbours of one target molecule" query is cheap. This is the default.
-- **Similarity** is computed for a configurable **subset of `N_SOURCE_MOLECULES` source molecules** (default 100) against the full corpus, then reduced to top-10 per source.
+- **Similarity** is computed for a configurable **subset of `N_SOURCE_MOLECULES` source molecules** (default 100) against the full corpus, then reduced to top-10 per source. This runs in about a minute and under a gigabyte.
 
-**Controlling the corpus size for local runs.** `FINGERPRINT_SAMPLE_SIZE` (unset by default) caps fingerprinting to a reproducible random sample of that many structures, for fast iteration on a laptop. Sample selection is deterministic for a given `RANDOM_SEED`. Note that when a sample is used, `choose_source_molecules` still draws from the full warehouse, so a chosen source may fall outside the sampled corpus and fail with "has no fingerprint in Silver"; for a coherent end-to-end sample run keep `N_SOURCE_MOLECULES` small and expect the corpus to be a subset. Leave `FINGERPRINT_SAMPLE_SIZE` unset for full, production-shaped runs.
+**Controlling the corpus size for local runs.** `FINGERPRINT_SAMPLE_SIZE` (unset by default) caps fingerprinting to a reproducible random sample of that many structures, for fast iteration on a laptop. Sample selection is deterministic for a given `RANDOM_SEED`. Because `choose_source_molecules` draws from the full warehouse (not the sample), a sample smaller than the source set means some sources have no fingerprint, so the similarity stage checks every source against the corpus up front and fails fast with a clear message (naming the count and the likely cause) *before* deleting anything, rather than erroring deep in the loop or silently producing partial results. For a coherent end-to-end sample run, keep `N_SOURCE_MOLECULES` at or below the sample size. Leave `FINGERPRINT_SAMPLE_SIZE` unset for full, production-shaped runs.
 
 ## Repository layout
 
@@ -184,6 +184,7 @@ $env:PGPASSWORD = (Get-Content dags/chembl_molecule_similarity_pipeline/.env |
 ```powershell
 # Worker image (used by every compute task)
 docker build -t pipeline_worker ./workers
+
 # Airflow stack + tunnel + keepalive
 docker compose -f dags/chembl_molecule_similarity_pipeline/docker-compose.airflow.yml `
   --env-file dags/chembl_molecule_similarity_pipeline/.env up -d --build
@@ -191,7 +192,7 @@ docker compose -f dags/chembl_molecule_similarity_pipeline/docker-compose.airflo
 
 Open `http://localhost:8080` and log in with `admin`/`admin` (configurable via `_AIRFLOW_WWW_USER_USERNAME` / `_AIRFLOW_WWW_USER_PASSWORD`).
 
-`.env`, compose, or image changes require recreating the containers (`down`/`up`), not `restart`. Environment variables are injected when a container is created, so `docker compose restart` reuses the already-loaded environment and your change silently won't apply. DAG code changes don't need this, since the scheduler reparses the dags folder on its own every ~30s and picks them up live. The one exception is when a `dag.py` change also introduces a new environment variable: the code reparses, but the variable won't be present until you recreate, so recreate then too.
+**`.env`, compose, or image changes require recreating the containers (`down`/`up`), not `restart`.** Environment variables are injected when a container is *created*, so `docker compose restart` reuses the already-loaded environment and your change silently won't apply. DAG *code* changes don't need this, since the scheduler reparses the dags folder on its own every ~30s and picks them up live. The one exception is when a `dag.py` change also introduces a **new environment variable**: the code reparses, but the variable won't be present until you recreate, so recreate then too.
 
 ```powershell
 docker compose -f dags/chembl_molecule_similarity_pipeline/docker-compose.airflow.yml down
