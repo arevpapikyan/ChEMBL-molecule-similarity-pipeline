@@ -71,7 +71,7 @@ def test_load_fact_similarity_row_shape(monkeypatch, top_k_table):
     assert captured["rows"][0] == ("CHEMBL1", "CHEMBL2", 0.9, 1, False)
 
 
-def test_fact_carries_every_column_the_brief_requires(monkeypatch, top_k_table):
+def test_fact_carries_every_column(monkeypatch, top_k_table):
     captured = {}
     monkeypatch.setattr(
         f"{MODULE}.upsert_rows",

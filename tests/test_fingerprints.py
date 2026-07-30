@@ -76,7 +76,7 @@ def test_generator_is_cached_per_parameter_pair():
     assert _morgan_generator(2, 2048) is not _morgan_generator(3, 2048)
 
 
-def test_settings_default_to_the_parameters_required_by_the_brief():
+def test_settings_default():
     settings = Settings(s3_bucket="b", dwh_url="postgresql://x", s3_prefix="p")
     assert settings.morgan_radius == 2
     assert settings.morgan_n_bits == 2048
