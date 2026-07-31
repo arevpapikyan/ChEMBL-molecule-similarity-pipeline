@@ -170,9 +170,8 @@ The second command prints `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_S
 
 ### 2. Fill in `.env`
 
-```bash
-cp dags/chembl_molecule_
-similarity_pipeline/.env.example dags/chembl_molecule_similarity_pipeline/.env
+```powershell
+Copy-Item dags/chembl_molecule_similarity_pipeline/.env.example dags/chembl_molecule_similarity_pipeline/.env
 ```
 
 Fill in the S3/DWH values, the AWS keys from step 1, `AWS_CONFIG_DIR` (absolute path; Compose does not expand `~` or `${HOME}`), `AIRFLOW__API_AUTH__JWT_SECRET`, and `TEAMS_WEBHOOK_URL`. See [Environment variables](#environment-variables) for the full list.
@@ -205,6 +204,32 @@ Open `http://localhost:8080` and log in with `admin`/`admin` (configurable via `
 docker compose -f dags/chembl_molecule_similarity_pipeline/docker-compose.airflow.yml down
 docker compose -f dags/chembl_molecule_similarity_pipeline/docker-compose.airflow.yml up -d
 ```
+
+### 5. Apply the DDL
+
+The `sql/` files are **not** applied by the pipeline -- run them once, in order, against the DWH through the tunnel started in step 4. `PGPASSWORD` from step 3 is what keeps this from prompting four times:
+
+```powershell
+$dwh = "-h localhost -p 5432 -U <user> -d <database>"
+psql $dwh.Split() -v ON_ERROR_STOP=1 -f sql/01_schema_raw.sql
+psql $dwh.Split() -v ON_ERROR_STOP=1 -f sql/02_schema_mart.sql
+psql $dwh.Split() -v ON_ERROR_STOP=1 -f sql/03_views_basic.sql
+psql $dwh.Split() -v ON_ERROR_STOP=1 -f sql/04_views_advanced.sql
+```
+
+Fill in `<user>` and `<database>` to match `DWH_URL`. All four files are idempotent (`CREATE ... IF NOT EXISTS`, `CREATE OR REPLACE VIEW`), so re-running them is safe.
+
+If you have no local `psql`, use a stock Postgres image -- the worker image will not work for this, since it ships `libpq-dev` for building `psycopg` but not the `psql` client binary:
+
+```powershell
+docker run --rm -v "${PWD}/sql:/sql" -e PGPASSWORD=$env:PGPASSWORD `
+  --add-host=host.docker.internal:host-gateway postgres:16 `
+  psql -h host.docker.internal -p 5432 -U <user> -d <database> -v ON_ERROR_STOP=1 -f /sql/01_schema_raw.sql
+```
+
+Without this step the first run fails in `ingest_bronze` on a missing `raw` schema.
+
+### 6. Trigger the DAG
 
 Trigger the `chembl_similarity_pipeline` DAG from the UI. It is capped at `max_active_runs=1`, so a fresh trigger can never collide with an older run.
 
