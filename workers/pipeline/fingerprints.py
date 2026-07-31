@@ -20,6 +20,9 @@ from .s3_utils import object_exists, read_json, read_parquet, write_json, write_
 logger = logging.getLogger(__name__)
 
 
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
 @cache
 def _morgan_generator(radius: int, n_bits: int):
     """Cached Morgan generator."""
@@ -58,7 +61,7 @@ def _eligible_molecule_count(settings: Settings) -> int:
 
 def _fingerprints_cache_is_valid(settings: Settings, s3_key: str, manifest_key: str) -> bool:
     """True if the cached fingerprint file can be reused as-is."""
-    if os.environ.get("FINGERPRINTS_FORCE_RECOMPUTE", "").lower() == "true":
+    if os.environ.get("FINGERPRINTS_FORCE_RECOMPUTE", "").strip().lower() in _TRUTHY:
         logger.info("FINGERPRINTS_FORCE_RECOMPUTE set; recomputing fingerprints")
         return False
 
