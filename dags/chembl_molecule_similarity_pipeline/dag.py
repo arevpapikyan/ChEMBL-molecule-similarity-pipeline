@@ -28,6 +28,13 @@ WORKER_ENV_VARS = [
     "RANDOM_SEED",
     "TOP_K",
     "FINGERPRINT_SAMPLE_SIZE",
+    "FINGERPRINTS_FORCE_RECOMPUTE",
+    "INGEST_MIN_FREE_BYTES",
+    "INGEST_DOWNLOAD_MAX_ATTEMPTS",
+    "INGEST_DOWNLOAD_RETRY_DELAY",
+    "INGEST_DOWNLOAD_SOCKET_TIMEOUT",
+    "INGEST_EXTRACTION_TIMEOUT_SECONDS",
+    "PYSTOW_HOME",
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
@@ -37,12 +44,24 @@ WORKER_ENV_VARS = [
 REQUIRED_ENV_VARS = [
     "S3_BUCKET",
     "S3_PREFIX",
-    "DWH_URL"
+    "DWH_URL",
     ]
 
 
 def worker_env() -> dict:
-    return {var: os.environ.get(var, "") for var in WORKER_ENV_VARS}
+    """Allowlisted config forwarded into the worker containers.
+
+    Variables that are unset or blank are omitted rather than forwarded as an
+    empty string, so the worker falls back to its own default. This matters for
+    the numeric knobs (INGEST_MIN_FREE_BYTES and friends), where forwarding ""
+    would make int("") raise at import time instead of using the default.
+    """
+    env = {}
+    for var in WORKER_ENV_VARS:
+        value = os.environ.get(var, "")
+        if value.strip():
+            env[var] = value
+    return env
 
 
 def _require_env() -> None:
