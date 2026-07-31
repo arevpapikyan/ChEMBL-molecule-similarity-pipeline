@@ -18,11 +18,10 @@ Inputs and outputs live under an S3 prefix of your choosing, set via `S3_PREFIX`
 
 ```
                   ┌─────────────┐      ┌───────────────┐      ┌───────────────┐
- ChEMBL           │  BRONZE     │      │  vSILVER       │      │  GOLD         │
+ ChEMBL           │  BRONZE     │      │  SILVER       │      │  GOLD         │
  (chembl_         │  raw        │      │  fingerprints │      │  dim_molecule │
  downloader)  ──> │  tables     │ ───> │  + full       │ ───> │  fact_        │
-                  │  (S3 +      │      │  
-                  similarity   │      │  similarity   │
+                  │  (S3 +      │      │  similarity   │      │  similarity   │
                   │  Postgres   │      │  tables       │      │  (Postgres)   │
                   │  raw schema │      │  (S3 parquet) │      │  + views      │
                   └─────────────┘      └───────────────┘      └───────────────┘
