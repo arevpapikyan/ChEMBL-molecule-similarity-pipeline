@@ -18,10 +18,11 @@ Inputs and outputs live under an S3 prefix of your choosing, set via `S3_PREFIX`
 
 ```
                   ┌─────────────┐      ┌───────────────┐      ┌───────────────┐
- ChEMBL           │  BRONZE     │      │  SILVER       │      │  GOLD         │
+ ChEMBL           │  BRONZE     │      │  vSILVER       │      │  GOLD         │
  (chembl_         │  raw        │      │  fingerprints │      │  dim_molecule │
  downloader)  ──> │  tables     │ ───> │  + full       │ ───> │  fact_        │
-                  │  (S3 +      │      │  similarity   │      │  similarity   │
+                  │  (S3 +      │      │  
+                  similarity   │      │  similarity   │
                   │  Postgres   │      │  tables       │      │  (Postgres)   │
                   │  raw schema │      │  (S3 parquet) │      │  + views      │
                   └─────────────┘      └───────────────┘      └───────────────┘
@@ -47,6 +48,8 @@ Orchestrated end-to-end by Airflow (DAG id `chembl_similarity_pipeline`, defined
 
 **Fact** (`fact_similarity`): source molecule, target molecule, Tanimoto score, `rank_within_source`, and the `has_duplicates_of_last_largest_score` flag. Holds the top-10 per source.
 
+**Supporting table** (`pivot_source_selection`): the 10 source molecules the pivot view is built over. Truncated and repopulated by `regenerate_pivot_view()` on every run; `crosstab` reads it for both the row source and the column list, so the view's columns and its data can never disagree.
+
 Five analytical views sit on top (all over the top-10 subset; sample output in [Results](#results)):
 
 - `v7a_avg_similarity_per_source`: average similarity score per source molecule.
@@ -61,7 +64,7 @@ The DWH sits in a private subnet reached through an AWS SSM tunnel. SSM is built
 
 - **Source molecules are picked inside the database.** `choose_source_molecules` samples in SQL (`ORDER BY md5(chembl_id || :seed) LIMIT :n`), so only the chosen rows cross the tunnel instead of all ~2.9M. Hashing with `RANDOM_SEED` keeps the choice random but reproducible.
 - **Bulk data moves in batches.** `_ingest_table` streams with `fetchmany` and `COPY`s each batch, so a dropped tunnel costs one batch, not the whole table.
-- **The fingerprint corpus loads once.** All sources are scored against a single in-memory matrix, instead of one container per source re-downloading the corpus. Fingerprints stay packed as `uint8` (~0.69 GB, not ~5.5 GB), keeping peak memory near 2 GB.
+- **The fingerprint corpus loads once.** All sources are scored against a single in-memory matrix, instead of one container per source re-downloading the corpus. Fingerprints stay packed as `uint8` (~0.69 GB, not ~5.5 GB), keeping peak RSS near 1 GB.
 - **Slow stages are cached and resumable.** The ChEMBL tarball, its extraction, and the fingerprint file are reused when still valid (guarded by completion markers and a manifest of `radius`/`n_bits`/`sample_size`/row count). Per-source similarity results already on S3 are skipped, so an interrupted run resumes.
 - **Stale outputs are pruned, and invalidated when the corpus changes.** Changing `N_SOURCE_MOLECULES` or `RANDOM_SEED` selects different molecules; old files are deleted first. This matters because `load_mart_from_s3` loads *every* `top10.parquet` under the prefix, so one orphan would silently add a source to `fact_similarity`. Separately, the per-source similarity outputs record a token identifying the fingerprint corpus they were built against (sample size, seed, count, Morgan params); if the current corpus no longer matches, for example when switching between a full run and a sample, the cached outputs are recomputed rather than reused, so the mart can never mix results from two different corpora.
 
@@ -102,6 +105,7 @@ dags/chembl_molecule_similarity_pipeline/
   Dockerfile.airflow         # apache/airflow:3.3.0 + FAB provider (admin/admin login)
   .env.example               # template -- copy to .env and fill in real values
   .airflowignore             # keeps compose/env files out of the DAG parser
+  teams_cards.py             # Adaptive Card builders for the Teams failure alert
   ssm_tunnel/
     Dockerfile               # aws-cli + session-manager-plugin + socat
     tunnel-loop.sh           # self-healing SSM port-forward, reconnects on drop
@@ -123,9 +127,11 @@ sql/
   01_schema_raw.sql          # bronze schema DDL
   02_schema_mart.sql         # gold schema DDL (dim_molecule, fact_similarity)
   03_views_basic.sql         # avg-similarity + alogp-deviation views
-  04_views_advanced.sql      # next/second-target + grouped-average views (pivot generated at runtime)
+  04_views_advanced.sql      # next/second-target + grouped-average views, plus the
+                             #   pivot_source_selection table (pivot view generated at runtime)
 tests/
   test_config.py             # settings validation + S3 layer-prefix contract
+  test_ingest.py             # Bronze ingestion: schema contract, batching, CSV/COPY encoding
   test_fingerprints.py       # Morgan generation, packing contract, determinism
   test_similarity.py         # Tanimoto kernel (packed), padding bits, chunking
   test_similarity_io.py      # S3 key handling, orphan pruning, top-k shaping
@@ -165,7 +171,8 @@ The second command prints `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_S
 ### 2. Fill in `.env`
 
 ```bash
-cp dags/chembl_molecule_similarity_pipeline/.env.example dags/chembl_molecule_similarity_pipeline/.env
+cp dags/chembl_molecule_
+similarity_pipeline/.env.example dags/chembl_molecule_similarity_pipeline/.env
 ```
 
 Fill in the S3/DWH values, the AWS keys from step 1, `AWS_CONFIG_DIR` (absolute path; Compose does not expand `~` or `${HOME}`), `AIRFLOW__API_AUTH__JWT_SECRET`, and `TEAMS_WEBHOOK_URL`. See [Environment variables](#environment-variables) for the full list.
@@ -212,7 +219,7 @@ Config reaches the pipeline two ways, which is why not every variable is handled
 
 ### Failure notifications
 
-Failures are posted to a Microsoft Teams channel via an incoming Workflow webhook (`TEAMS_WEBHOOK_URL`). A preflight task, `check_teams_webhook`, runs first and fails the whole run if the webhook is missing or unreachable, so a long run never proceeds unable to report its own outcome. Delivery is strict: any non-2xx response counts as a failure (a revoked webhook still accepts the connection and returns 4xx). Set `TEAMS_ALERTS_OPTIONAL=true` to run deliberately without alerting.
+Failures are posted to a Microsoft Teams channel via an incoming Workflow webhook (`TEAMS_WEBHOOK_URL`). The card is built in `teams_cards.py` as a multiple-choice "pop quiz": the real exception is mixed in with fixed joke distractors and the options are shuffled, so the true cause is not always in the same slot. A preflight task, `check_teams_webhook`, runs first and fails the whole run if the webhook is missing or unreachable, so a long run never proceeds unable to report its own outcome. Delivery is strict: any non-2xx response counts as a failure (a revoked webhook still accepts the connection and returns 4xx). Set `TEAMS_ALERTS_OPTIONAL=true` to run deliberately without alerting.
 
 ### Credential safety
 
@@ -234,22 +241,23 @@ deactivate
 
 No `.env`, network, or credentials required: S3 and Postgres are monkeypatched at the module boundary. (The same tests also run inside the `pipeline_worker` image, which is built from the same `requirements.txt`, so the venv is only for running them directly on your host.)
 
-| File                      | Covers                                                                                                                                                                     |
-| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `test_similarity.py`    | Tanimoto on packed fingerprints: known values, padding-bit masking at non-byte-aligned widths, chunk-size invariance, symmetry, and agreement with a brute-force reference |
-| `test_similarity_io.py` | S3 key parsing, orphan pruning, self-exclusion, skip-existing, and that the batch path produces byte-identical output to the single-source path                            |
-| `test_topk_ranking.py`  | Ranking order and the`has_duplicates_of_last_largest_score` boundary semantics, including ties that fit inside k, overflow it, or land exactly on it                     |
-| `test_fingerprints.py`  | Morgan parameters, the packing contract the similarity kernel depends on, determinism across equivalent SMILES spellings, and generator caching                            |
-| `test_config.py`        | Required-variable validation, defaults, and the S3 layer-prefix contract every stage shares                                                                                |
-| `test_mart_load.py`     | Fact-row shaping and that`dim_molecule` receives exactly the molecules the facts reference                                                                               |
+| File                      | Covers                                                                                                                                                                      |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `test_similarity.py`    | Tanimoto on packed fingerprints: known values, padding-bit masking at non-byte-aligned widths, chunk-size invariance, symmetry, and agreement with a brute-force reference  |
+| `test_similarity_io.py` | S3 key parsing, orphan pruning, self-exclusion, skip-existing, and that the batch path produces byte-identical output to the single-source path                             |
+| `test_topk_ranking.py`  | Ranking order and the`has_duplicates_of_last_largest_score` boundary semantics, including ties that fit inside k, overflow it, or land exactly on it                      |
+| `test_fingerprints.py`  | Morgan parameters, the packing contract the similarity kernel depends on, determinism across equivalent SMILES spellings, and generator caching                             |
+| `test_config.py`        | Required-variable validation, defaults, and the S3 layer-prefix contract every stage shares                                                                                 |
+| `test_ingest.py`        | Bronze ingestion: the declared column/schema contract, entity filtering, batching invariance, and CSV encoding for`COPY` (nulls, quotes, newlines, backslashes in SMILES) |
+| `test_mart_load.py`     | Fact-row shaping and that`dim_molecule` receives exactly the molecules the facts reference                                                                                |
 
 ## Verifying a run
 
 `scripts/verify_outputs.py` inspects a completed run end-to-end and prints the tables under [Results](#results). It needs a live DWH, live S3, and real credentials, so it lives under `scripts/` and is never collected by `pytest`. Run it in the worker container (which supplies the env and can resolve `host.docker.internal`):
 
 ```bash
-docker run --rm --env-file dags/chembl_molecule_similarity_pipeline/.env \
-  --add-host=host.docker.internal:host-gateway \
+docker run --rm --env-file dags/chembl_molecule_similarity_pipeline/.env `
+  --add-host=host.docker.internal:host-gateway `
   -v "$(pwd):/work" --entrypoint python pipeline_worker /work/scripts/verify_outputs.py
 ```
 
@@ -278,7 +286,7 @@ Grouped by what reads them. Everything lives in `.env` (see `.env.example`); not
 | `TOP_K`                             | Neighbours kept per source. Default`10`; read by the DAG and `verify_outputs.py`                                                                                                                                                   |
 | `RANDOM_SEED`                       | Fixed seed for reproducible source and fingerprint-sample selection. Default`42`                                                                                                                                                     |
 | `FINGERPRINT_SAMPLE_SIZE`           | Unset (default) fingerprints the full compound set. Set to a positive integer to fingerprint only a reproducible random sample of that size for fast local/dev runs. See[Scale and compute limitations](#scale-and-compute-limitations) |
-| `FINGERPRINTS_FORCE_RECOMPUTE`      | Set`1` to ignore the fingerprint manifest and recompute from scratch                                                                                                                                                                 |
+| `FINGERPRINTS_FORCE_RECOMPUTE`      | Set`1` (or `true`) to ignore the fingerprint manifest and recompute from scratch                                                                                                                                                   |
 | `INGEST_MIN_FREE_BYTES`             | Disk the extraction preflight requires. Default 50 GiB                                                                                                                                                                                 |
 | `INGEST_DOWNLOAD_MAX_ATTEMPTS`      | Resumable-download retries. Default 10                                                                                                                                                                                                 |
 | `INGEST_DOWNLOAD_RETRY_DELAY`       | Seconds between download retries. Default 15                                                                                                                                                                                           |
@@ -316,17 +324,17 @@ Reproduce with `scripts/verify_outputs.py` (see [Verifying a run](#verifying-a-r
 
 ### Volumes
 
-| Layer  | Object                      | Rows / objects                                    |
-| ------ | --------------------------- | ------------------------------------------------- |
-| Bronze | `raw.chembl_id_lookup`    | 3,082,236 rows                                    |
-| Bronze | `raw.molecule_dictionary` | 2,921,148 rows                                    |
-| Bronze | `raw.compound_properties` | 2,901,464 rows                                    |
-| Bronze | `raw.compound_structures` | 2,897,819 rows                                    |
-| Silver | `silver/fingerprints/`    | 1 Parquet + 1 manifest (2 objects)                |
-| Silver | `silver/similarity/`      | 100 Parquet (one per source, full pairwise table) |
-| Silver | `silver/topk/`            | 100 Parquet (one per source, top-10)              |
-| Gold   | `mart.dim_molecule`       | 1,100 rows                                        |
-| Gold   | `mart.fact_similarity`    | 1,000 rows (100 sources x 10)                     |
+| Layer  | Object                      | Rows / objects                              |
+| ------ | --------------------------- | ------------------------------------------- |
+| Bronze | `raw.chembl_id_lookup`    | 3,082,236 rows                              |
+| Bronze | `raw.molecule_dictionary` | 2,921,148 rows                              |
+| Bronze | `raw.compound_properties` | 2,901,464 rows                              |
+| Bronze | `raw.compound_structures` | 2,897,819 rows                              |
+| Silver | `silver/fingerprints/`    | 1 Parquet + 1 manifest (2 objects)          |
+| Silver | `silver/similarity/`      | 100 Parquet + 1 corpus marker (101 objects) |
+| Silver | `silver/topk/`            | 100 Parquet (one per source, top-10)        |
+| Gold   | `mart.dim_molecule`       | 1,100 rows                                  |
+| Gold   | `mart.fact_similarity`    | 1,000 rows (100 sources x 10)               |
 
 38 of the 1,000 fact rows carry `has_duplicates_of_last_largest_score = true`.
 
