@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+venv/
+
+.env
+
+dags/chembl_molecule_similarity_pipeline/logs/

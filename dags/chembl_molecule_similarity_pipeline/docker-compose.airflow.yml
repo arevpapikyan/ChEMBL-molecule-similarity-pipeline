@@ -1,0 +1,108 @@
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  image: chembl-similarity-airflow:3.3.0-fab
+  env_file:
+    - .env
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow_meta_db/airflow
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow_api_server:8080/execution/
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__PARALLELISM: "8"
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "8"
+    AIRFLOW__CORE__HOSTNAME_CALLABLE: airflow.utils.net.get_host_ip_address
+    AIRFLOW__SCHEDULER__SCHEDULER_ZOMBIE_TASK_THRESHOLD: "14400"
+    AIRFLOW__WORKERS__MAX_FAILED_HEARTBEATS: "10"
+    AIRFLOW__WORKERS__MIN_HEARTBEAT_INTERVAL: "30"
+    AIRFLOW__SCHEDULER__TASK_INSTANCE_HEARTBEAT_TIMEOUT: "600"
+    AIRFLOW__SCHEDULER__TASK_INSTANCE_HEARTBEAT_TIMEOUT_DETECTION_INTERVAL: "30"
+    AIRFLOW__DAG_PROCESSOR__DAG_FILE_PROCESSOR_TIMEOUT: "300"
+    AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT: "300"
+    AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "120"
+    AWS_PROFILE: ""
+  volumes:
+    - .:/opt/airflow/dags/chembl_molecule_similarity_pipeline:ro
+    - ./logs:/opt/airflow/logs
+    - /var/run/docker.sock:/var/run/docker.sock
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  depends_on:
+    airflow_meta_db:
+      condition: service_healthy
+
+services:
+  airflow_meta_db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_meta_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  airflow_init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command: -c "airflow db migrate && airflow users create --username \"$${_AIRFLOW_WWW_USER_USERNAME}\" --password \"$${_AIRFLOW_WWW_USER_PASSWORD}\" --firstname Admin --lastname User --role Admin --email admin@example.com"
+
+  airflow_api_server:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow_meta_db:
+        condition: service_healthy
+      airflow_init:
+        condition: service_completed_successfully
+
+  airflow_scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow_meta_db:
+        condition: service_healthy
+      airflow_init:
+        condition: service_completed_successfully
+
+  airflow_dag_processor:
+    <<: *airflow-common
+    command: dag-processor
+    depends_on:
+      airflow_meta_db:
+        condition: service_healthy
+      airflow_init:
+        condition: service_completed_successfully
+
+  keepalive:
+    image: postgres:16
+    entrypoint: /bin/bash
+    command: -c "while true; do pg_isready -h host.docker.internal -p 5432 || true; sleep 240; done"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  ssm_tunnel:
+    build:
+      context: ./ssm_tunnel
+    environment:
+      AWS_REGION: ${AWS_REGION:?set AWS_REGION in .env (see .env.example)}
+      AWS_PROFILE: ${AWS_PROFILE:?set AWS_PROFILE in .env (see .env.example)}
+      SSM_TARGET: ${SSM_TARGET:?set SSM_TARGET in .env (see .env.example)}
+      DWH_HOST: ${DWH_HOST:?set DWH_HOST in .env (see .env.example)}
+      DWH_PORT: ${DWH_PORT:-5432}
+    volumes:
+      - ${AWS_CONFIG_DIR:?set AWS_CONFIG_DIR in .env (see .env.example)}:/root/.aws
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
+volumes:
+  airflow_meta_data:
