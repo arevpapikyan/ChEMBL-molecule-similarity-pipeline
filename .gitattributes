@@ -1,0 +1,7 @@
+# Normalise line endings so shell scripts and Dockerfiles stay LF in the
+# repo regardless of the checkout platform. A CRLF shebang line makes a
+# container entrypoint fail with a bare "not found".
+* text=auto eol=lf
+*.sh   text eol=lf
+*.png  binary
+*.jpg  binary

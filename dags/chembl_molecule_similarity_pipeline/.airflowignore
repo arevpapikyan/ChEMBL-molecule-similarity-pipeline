@@ -1,0 +1,5 @@
+docker-compose.airflow.yml
+.env
+.env.example
+Dockerfile.airflow
+logs/
