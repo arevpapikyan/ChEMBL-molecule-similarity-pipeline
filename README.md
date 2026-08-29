@@ -104,7 +104,6 @@ dags/chembl_molecule_similarity_pipeline/
   Dockerfile.airflow         # apache/airflow:3.3.0 + FAB provider (admin/admin login)
   .env.example               # template -- copy to .env and fill in real values
   .airflowignore             # keeps compose/env files out of the DAG parser
-  teams_cards.py             # Adaptive Card builders for the Teams failure alert
   ssm_tunnel/
     Dockerfile               # aws-cli + session-manager-plugin + socat
     tunnel-loop.sh           # self-healing SSM port-forward, reconnects on drop
@@ -243,7 +242,7 @@ Config reaches the pipeline two ways, which is why not every variable is handled
 
 ### Failure notifications
 
-Failures are posted to a Microsoft Teams channel via an incoming Workflow webhook (`TEAMS_WEBHOOK_URL`). The card is built in `teams_cards.py` as a multiple-choice "pop quiz": the real exception is mixed in with fixed joke distractors and the options are shuffled, so the true cause is not always in the same slot. A preflight task, `check_teams_webhook`, runs first and fails the whole run if the webhook is missing or unreachable, so a long run never proceeds unable to report its own outcome. Delivery is strict: any non-2xx response counts as a failure (a revoked webhook still accepts the connection and returns 4xx). Set `TEAMS_ALERTS_OPTIONAL=true` to run deliberately without alerting.
+Failures are posted to a Microsoft Teams channel via an incoming Workflow webhook (`TEAMS_WEBHOOK_URL`). A preflight task, `check_teams_webhook`, runs first and fails the whole run if the webhook is missing or unreachable, so a long run never proceeds unable to report its own outcome. Delivery is strict: any non-2xx response counts as a failure (a revoked webhook still accepts the connection and returns 4xx). Set `TEAMS_ALERTS_OPTIONAL=true` to run deliberately without alerting.
 
 ### Credential safety
 

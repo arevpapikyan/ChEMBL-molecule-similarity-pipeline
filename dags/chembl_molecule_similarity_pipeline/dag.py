@@ -10,7 +10,6 @@ import psycopg2
 import requests
 from airflow.providers.docker.operators.docker import DockerOperator
 from airflow.sdk import DAG, task
-from chembl_molecule_similarity_pipeline.teams_cards import build_failure_quiz_card
 from docker.types import Mount
 
 logger = logging.getLogger(__name__)
@@ -192,18 +191,21 @@ def _post_to_teams(payload: dict) -> None:
 
 
 def notify_failure(context) -> None:
-    """Posts a 'pop quiz' failure card to Teams (card built in teams_cards)."""
+    """Posts a failure card with the error to Teams."""
     ti = context["task_instance"]
     exc = context.get("exception")
     real_error = f"{type(exc).__name__}: {exc}" if exc is not None else "Unknown error"
     map_index_suffix = f" (map_index={ti.map_index})" if ti.map_index != -1 else ""
 
-    _post_to_teams(build_failure_quiz_card(
-        dag_id=ti.dag_id,
-        task_id=f"{ti.task_id}{map_index_suffix}",
-        when=str(context.get("ts") or context.get("run_id", "")),
-        real_error=real_error,
-        submitted_by=os.environ.get("DAG_OWNER", "unknown"),
+    _post_to_teams(_adaptive_card(
+        "\U0001f6a9 PIPELINE FAILURE \U0001f6a9",
+        [
+            ("DAG", ti.dag_id),
+            ("Task", f"{ti.task_id}{map_index_suffix}"),
+            ("When", str(context.get("ts") or context.get("run_id", ""))),
+            ("Owner", os.environ.get("DAG_OWNER", "unknown")),
+        ],
+        real_error,
     ))
 
 
